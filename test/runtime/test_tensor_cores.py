@@ -60,10 +60,11 @@ def helper_tc_ensure_uops_and_opts_count(N: int, M:int, K:int, dtype_in:DType, d
     except KernelOptError: pass
 
 def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axis:int=0, tc_select:int=-1, tc_opt:int=0, use_tensor_cores:int=1,
-                       extra_opts:list[Opt]=[], signed:bool=False):
+                       extra_opts:list[Opt]=[], signed:bool=False, cast_inputs:bool=False):
   _skip_unsupported_tc_dtypes(dtype_in, dtype_out)
   a, b = _tc_rand(M, K, dtype=dtype_in, signed=signed), _tc_rand(K, N, dtype=dtype_in, signed=signed)
   np_a, np_b = a.numpy(), b.numpy()
+  if cast_inputs: a, b = a.cast(dtype_out), b.cast(dtype_out)
   r = a.matmul(b, dtype=dtype_out)
   if dtype_in == dtypes.bfloat16: r = r.float()
   realized_ast, bufs = helper_realized_ast(r)
@@ -82,6 +83,15 @@ def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axi
   np.testing.assert_allclose(c, ref, atol=tc_atol, rtol=tc_rtol)
 
 class TestTensorCores(unittest.TestCase):
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_widened_inputs(self):
+    for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
+      if tc.dtype_in not in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s) or tc.dtype_out != dtypes.float32: continue
+      for pad in (0, 1):
+        with self.subTest(tc=tc, pad=pad):
+          helper_tc_allclose(tc.dims[0]+pad, tc.dims[1]+pad, tc.dims[2]+pad, tc.dtype_in, tc.dtype_out,
+                            tc_select=i, tc_opt=2 if pad else 0, signed=True, cast_inputs=True)
+
   def test_tensor_cores_fp8_signed(self):
     for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
       if tc.dtype_in not in dtypes.fp8s: continue

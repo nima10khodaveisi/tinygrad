@@ -389,7 +389,10 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     if x.shape[-1] != w.shape[axis_w:=-min(w.ndim,2)]: raise RuntimeError(f"cannot dot {x.shape} and {w.shape}")
     x = x.reshape(*x.shape[0:-1], *[1]*min(dx-1, dw-1, 1), x.shape[-1])
     w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
-    return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else dtype)
+    dt = least_upper_dtype(x.dtype, w.dtype)
+    if dtypes.is_float(dt):
+      x, w = (t.cast(least_upper_dtype(dt, sum_acc_dtype(dt) if dtype is None else to_dtype(dtype))) for t in (x, w))
+    return (x*w).sum(-1, dtype=dtype).cast(dt if dtype is None else dtype)
 
   def matmul(self, x:Self, reverse=False, dtype:DTypeLike|None=None) -> Self:
     """
