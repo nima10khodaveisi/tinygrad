@@ -11,7 +11,6 @@ from tinygrad.dtype import dtypes, DType, _to_np_dtype
 from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
 if TYPE_CHECKING:
   from tinygrad.renderer import Renderer
-  from tinygrad.uop.ops import UOp
 
 # **************** Device ****************
 
@@ -393,7 +392,6 @@ class Compiled:
     self.pending:dict[Compiled, int] = {} # timeline values of the devices that touched our memory
 
     # profiling
-    self.prog_bufs:dict[UOp, Buffer] = {} # cache bufferized for programs
     self.prof_ents:dict[tuple[Buffer, int], ProfileGraphEntry] = {} # (a batch's timestamps, start slot) -> entry, read at synchronize
 
   @property
@@ -418,8 +416,6 @@ class Compiled:
     return Buffer(self.device, self.rt_allocator(spec).size, options=spec, preallocate=True)
 
   def tag(self, *parts:str) -> str: return to_name(self.device, *parts) # of the placeholders it owns
-  def program_buffer(self, b:UOp) -> Buffer:
-    return self.prog_bufs.setdefault(b, Buffer(self.device, b.max_numel() * b.dtype.itemsize, options=BufferSpec(cpu_access=True, nolru=True)))
 
   @functools.cached_property
   def timeline(self) -> Buffer: # [the signal, the value the last submitted batch signals]
