@@ -842,7 +842,7 @@ class TestMultiTensor(unittest.TestCase):
     devices = (d0, d1, d2, d3)
     t = Tensor.zeros(16, 16).contiguous()
     t.shard_(devices, axis=0).realize()
-    assert all([lb is lb.base and lb.realized.base.size == 4 * 16 for lb in t.uop.src])
+    assert all([lb is lb.base and lb.realized.base.nbytes == 4 * 16 * lb.dtype.itemsize for lb in t.uop.src])
 
   def test_clone(self):
     for axis in (None, 0):

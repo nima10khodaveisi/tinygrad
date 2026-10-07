@@ -18,6 +18,17 @@ class MockMultiOutputModel:
 # TODO: move compile_efficientnet tests here
 @unittest.skipUnless(Device.DEFAULT in EXPORT_SUPPORTED_DEVICE, f"Model export is not supported on {Device.DEFAULT}")
 class TextModelExport(unittest.TestCase):
+  def test_weight_metadata(self):
+    class MyModel:
+      def __init__(self, dtype): self.weight = Tensor([1, 2, 3, 4], dtype=dtype).realize()
+      def __call__(self, x): return x + self.weight
+    for dtype in (dtypes.float32, dtypes.int16):
+      with self.subTest(dtype=dtype):
+        model = MyModel(dtype)
+        prg, _, _, _ = export_model(model, "", Tensor([4, 3, 2, 1], dtype=dtype).realize())
+        weights = [b for b in json.loads(prg)["buffers"].values() if b["id"] == "weight"]
+        self.assertEqual(weights, [{"size": 4 * dtype.itemsize, "dtype": dtype.name, "id": "weight"}])
+
   def test_multi_input_model_export(self):
     model = MockMultiInputModel()
     inputs = [Tensor.rand(2,2), Tensor.rand(2,2), Tensor.rand(2,2)]
