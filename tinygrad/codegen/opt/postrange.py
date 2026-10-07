@@ -4,7 +4,7 @@ from typing import cast
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, identity_element
 from tinygrad.uop.ops import axis_colors
 from tinygrad.device import Buffer
-from tinygrad.dtype import dtypes
+from tinygrad.dtype import dtypes, can_lossless_cast
 from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element
 from tinygrad.helpers import ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
@@ -160,9 +160,14 @@ class Scheduler:
     if reduceop.arg[0] is Ops.ADD:
       mul = reduceop.src[0] if reduceop.src[0].op is not Ops.CAST else reduceop.src[0].src[0]
       if mul.op is not Ops.MUL: return None
-      in0, in1 = mul.src
       for tc in self.ren.tensor_cores if tc_select == -1 else [self.ren.tensor_cores[tc_select]]:
         if self.ren.target.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
+        def tc_input(x:UOp) -> UOp:
+          if (x.op is Ops.CAST and x.dtype == tc.dtype_out and x.src[0].dtype == tc.dtype_in
+              and can_lossless_cast(tc.dtype_in, tc.dtype_out)):
+            return x.src[0]
+          return x
+        in0, in1 = map(tc_input, mul.src)
         if tc.dtype_in == in0.dtype and tc.dtype_in == in1.dtype and tc.dtype_out == reduceop.dtype:
           # tensor cores have three ranges. X, Y, and REDUCE
           in0_ranges = sorted([u for u in in0.ranges if u not in in1.ranges], key=lambda x: x.arg, reverse=True)
@@ -200,7 +205,8 @@ class Scheduler:
             reduceop = get_single_element([x for x in self.reduceops if axes[2] in x.src[1:]])
             gate, mul = (r0.src[0], r0.src[1]) if (r0:=reduceop.src[0]).op is Ops.WHERE else (None, r0)
             if mul.op is Ops.CAST: mul = mul.src[0]
-            ins = mul.src if gate is None else tuple(gate.where(x, UOp.const(0, x.dtype)) for x in mul.src)
+            ins = tuple(tc_input(x) for x in mul.src)
+            if gate is not None: ins = tuple(gate.where(x, UOp.const(0, x.dtype)) for x in ins)
             srcs = [x.substitute({ne[a]: ne[b] for a,b in rl.items()}, walk=True) for x,rl in zip(ins, tc.relabel())]
 
             # get upcast axes for the tensor cores

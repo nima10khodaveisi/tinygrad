@@ -82,6 +82,13 @@ def helper_tc_allclose(N:int, M:int, K:int, dtype_in:DType, dtype_out:DType, axi
   np.testing.assert_allclose(c, ref, atol=tc_atol, rtol=tc_rtol)
 
 class TestTensorCores(unittest.TestCase):
+  @unittest.skipUnless(Device[Device.DEFAULT].renderer.tensor_cores, "test requires tensor cores")
+  def test_tensor_cores_padded_widened_products(self):
+    for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
+      if tc.dtype_in not in (dtypes.half, dtypes.bfloat16, *dtypes.fp8s) or tc.dtype_out != dtypes.float32: continue
+      with self.subTest(tc=tc):
+        helper_tc_allclose(tc.dims[0]+1, tc.dims[1]+1, tc.dims[2]+1, tc.dtype_in, tc.dtype_out, tc_select=i, tc_opt=2, signed=True)
+
   def test_tensor_cores_fp8_signed(self):
     for i, tc in enumerate(Device[Device.DEFAULT].renderer.tensor_cores):
       if tc.dtype_in not in dtypes.fp8s: continue
