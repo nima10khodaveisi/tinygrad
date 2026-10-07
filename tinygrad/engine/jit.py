@@ -89,6 +89,9 @@ def _prepare_jit_inputs(args, kwargs):
     tensors += [t for t in it if t.__class__ is Tensor and not any(t is y for y in tensors)]
   def get_input_uops() -> list[UOp]: return flatten([[t.uop.src[0]] if t.uop.op is Ops.UNSHARD else [t.uop] for t in tensors])
   if any(u.is_virtual for u in get_input_uops()): raise JitError("JIT inputs must be real buffers; use .clone()")
+  # Check aliases before realizing typed views, which can materialize them into independent buffers.
+  storage = [u.storage_base for u in get_input_uops() if u.storage_base.has_buffer_identity()]
+  if len(set(storage)) != len(storage): raise JitError("duplicate inputs to JIT")
   if len(unrealized_tensors := [x for x in tensors if not x.uop.is_realized]): Tensor.realize(*unrealized_tensors)
   input_uops = get_input_uops()
   # collect buffer UOps (including MultiBuffer)

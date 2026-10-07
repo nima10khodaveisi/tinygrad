@@ -1,6 +1,7 @@
-import unittest, struct, pickle
-from tinygrad import Tensor, dtypes
+import unittest, struct, pickle, weakref, gc
+from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.device import Buffer
+from tinygrad.engine.jit import JitError
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp
 
@@ -9,10 +10,81 @@ class TestBuffer(unittest.TestCase):
     b = Buffer("CPU", 8, initial_value=struct.pack("ff", 1, 2))
     floats, ints = (UOp.from_buffer(b, dt) for dt in (dtypes.float32, dtypes.uint32))
     self.assertIs(floats.buffer, ints.buffer)
+    self.assertIs(floats.storage_base, ints.storage_base)
     self.assertEqual((floats.shape, ints.shape), ((2,), (2,)))
     self.assertEqual((Tensor(floats) + 1).tolist(), [2, 3])
     self.assertEqual(Tensor(ints).tolist(), [0x3f800000, 0x40000000])
     self.assertEqual(b.numpy(dtypes.float32).tolist(), [1, 2])
+
+  def test_overlapping_interpretations(self):
+    for dtype in (dtypes.uint32, dtypes.uint16, dtypes.uint8):
+      for reverse in (False, True):
+        with self.subTest(dtype=dtype, reverse=reverse):
+          b = Buffer("CPU", 4096, initial_value=struct.pack("1024f", *range(1, 1025)))
+          types = (dtype, dtypes.float32) if reverse else (dtypes.float32, dtype)
+          a, c = [Tensor(UOp.from_buffer(b, dt)) for dt in types]
+          f, i = (c, a) if reverse else (a, c)
+          f.assign(i.bitcast(dtypes.float32).flip(0)).realize()
+          self.assertEqual(f.tolist(), list(range(1024, 0, -1)))
+
+  def test_rewrap_new_buffer(self):
+    f = UOp.new_buffer("CPU", 1024, dtypes.float32)
+    f.buffer.ensure_allocated().copy_from(Buffer("CPU", 4096, initial_value=struct.pack("1024f", *range(1, 1025))))
+    i = UOp.from_buffer(f.buffer, dtypes.uint32)
+    self.assertIs(i.storage_base, f)
+    out = Tensor(f).assign(Tensor(i).flip(0).bitcast(dtypes.float32)).realize()
+    self.assertEqual(out.tolist(), list(range(1024, 0, -1)))
+
+  def test_overlapping_buffer_views(self):
+    b = Buffer("CPU", 4100, initial_value=struct.pack("1025f", *range(1025)))
+    dst = Tensor(UOp.from_buffer(b.view(4096, 4), dtypes.float32))
+    src = Tensor(UOp.from_buffer(b.view(4096, 0), dtypes.uint16))
+    self.assertIs(dst.uop.storage_base, src.uop.storage_base)
+    dst.assign(src.bitcast(dtypes.float32)).realize()
+    self.assertEqual(b.numpy(dtypes.float32).tolist(), [0] + list(range(1024)))
+
+  def test_jit_aliased_interpretations(self):
+    for dtype in (dtypes.uint32, dtypes.uint16, dtypes.uint8):
+      with self.subTest(dtype=dtype):
+        @TinyJit
+        def add(f, i): return (f + i.bitcast(dtypes.float32)).realize()
+        b = Buffer("CPU", 16, initial_value=struct.pack("4f", 1, 2, 3, 4))
+        f, i = (Tensor(UOp.from_buffer(b, dt)) for dt in (dtypes.float32, dtype))
+        with self.assertRaisesRegex(JitError, "duplicate inputs"): add(f, i)
+        for step in range(4):
+          data = struct.pack("4f", *range(step, step+4))
+          f, i = (Tensor(UOp.from_buffer(Buffer("CPU", 16, initial_value=data), dt)) for dt in (dtypes.float32, dtype))
+          self.assertEqual(add(f, i).tolist(), [2*x for x in range(step, step+4)])
+        alias = Tensor(UOp.from_buffer(f.uop.buffer, dtype))
+        with self.assertRaisesRegex(JitError, "duplicate inputs"): add(f, alias)
+
+  def test_jit_typed_view(self):
+    @TinyJit
+    def add(x): return (x + 1).realize()
+    for step in range(4):
+      f = UOp.new_buffer("CPU", 4, dtypes.float32)
+      f.buffer.ensure_allocated().copy_from(Buffer("CPU", 16, initial_value=struct.pack("4I", *range(step, step+4))))
+      self.assertEqual(add(Tensor(UOp.from_buffer(f.buffer, dtypes.uint32))).tolist(), list(range(step+1, step+5)))
+
+  def test_interpretation_lifetime(self):
+    f = UOp.new_buffer("CPU", 4, dtypes.float32)
+    i = UOp.from_buffer(f.buffer, dtypes.uint16)
+    buffer_ref, root_ref = weakref.ref(f.buffer), weakref.ref(f)
+    del f
+    self.assertIs(i.storage_base, root_ref())
+    del i
+    gc.collect()
+    self.assertIsNone(root_ref())
+    self.assertIsNone(buffer_ref())
+
+  def test_pickle_shared_interpretations(self):
+    b = Buffer("CPU", 16, initial_value=struct.pack("4f", 1, 2, 3, 4))
+    f = UOp.from_buffer(b, dtypes.float32)
+    f, i = pickle.loads(pickle.dumps((f, UOp.from_buffer(b, dtypes.uint16))))
+    self.assertIs(f.storage_base, i.storage_base)
+    self.assertIs(UOp.from_buffer(f.buffer, dtypes.uint8).storage_base, f)
+    Tensor(f).assign(Tensor(i).bitcast(dtypes.float32).flip(0)).realize()
+    self.assertEqual(f.buffer.numpy(dtypes.float32).tolist(), [4, 3, 2, 1])
 
   def test_invalid_interpretation(self):
     for dt in (dtypes.uint32, dtypes.void, dtypes.weakint, dtypes.weakfloat):

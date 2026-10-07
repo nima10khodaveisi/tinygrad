@@ -188,10 +188,13 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
 
 class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
+  buffer_uops:weakref.WeakValueDictionary[tuple[Buffer|MultiBuffer, str|tuple[str, ...]], UOp] = weakref.WeakValueDictionary()
   def __call__(cls, op:Ops, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None, metadata:tuple[Metadata,...]|None=None):
     # NOTE: the key must separate nodes of different dtype: a CONST's dtype is the type of its arg, and True == 1 as dict keys
     if (wret:=UOpMetaClass.ucache.get(key:=(op, src, arg, tag, type(arg)), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(op, src, arg, tag))
+    if op is Ops.BUFFER and arg.buffer is not None and tag is None:
+      UOpMetaClass.buffer_uops.setdefault((arg.buffer, arg.device), created)
     if metadata is not None: all_metadata[created] = metadata
     if SPEC > 1:
       from tinygrad.uop.spec import spec_full
@@ -837,11 +840,15 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     return UOp(Ops.BUFFER, src=(UOp.const(size),)+UOp.device_range_src(device), arg=ParamArg(slot, dtype, device=device, buffer=buf))
   @staticmethod
   def from_buffer(opaque:Buffer|MultiBuffer, dtype:DType, device:str|tuple[str, ...]|None=None):
-    # the opaque Buffer goes straight in the arg: the ucache dedups because the arg (and thus the Buffer) is part of the key
     assert dtype not in dtypes.weaks and dtype.itemsize > 0 and opaque.nbytes % dtype.itemsize == 0, \
       f"cannot interpret {opaque.nbytes} bytes as {dtype}"
-    return UOp(Ops.BUFFER, src=(UOp.const(opaque.nbytes//dtype.itemsize),)+UOp.device_range_src(device or opaque.device),
-               arg=ParamArg(-id(opaque), dtype, device=device or opaque.device, buffer=opaque))
+    device = device or opaque.device
+    if isinstance(opaque, Buffer) and opaque.base is not opaque:
+      return UOp.from_buffer(opaque.base, dtypes.uint8, device)[opaque.offset:opaque.offset+opaque.nbytes].bitcast(dtype)
+    # Reuse the live graph's storage root, including roots created by new_buffer. Types are views of that root.
+    if (root := UOpMetaClass.buffer_uops.get((opaque, device))) is not None: return root.bitcast(dtype)
+    return UOp(Ops.BUFFER, src=(UOp.const(opaque.nbytes//dtype.itemsize),)+UOp.device_range_src(device),
+               arg=ParamArg(-id(opaque), dtype, device=device, buffer=opaque))
   def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
     device = canonicalize_device(self.device if device is None else device)
     axis = self.axis if isinstance(device, tuple) else None
@@ -958,10 +965,10 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def buffer(self) -> Buffer|MultiBuffer:
     # a bare STAGE (same-device materialization) keeps the source's buffer
     if self.op is Ops.STAGE and self.arg is None: return self.src[0].buffer
-    if self.op in {Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER}: return self.src[0].buffer
+    if self.op in {Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER, Ops.BITCAST}: return self.src[0].buffer
     # this buffer can process disk tensors and simple movement ops.
     # NOTE: the view Buffer returned here is transient (short-lived), it only wraps an offset into the base BUFFER's storage
-    if self is not self.base or self.op is Ops.BITCAST:
+    if self is not self.base:
       src, offset = self._buffer_view
       if isinstance(buf:=src.buffer, MultiBuffer):
         mbuf = MultiBuffer.__new__(MultiBuffer)

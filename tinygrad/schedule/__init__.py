@@ -1,5 +1,5 @@
 import time, inspect
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import GroupOp, remove_all_tags, UOp, Ops, UOpMetaClass, graph_rewrite, gate_kernel_sink, KernelInfo
@@ -262,6 +262,16 @@ def transform_to_call(big_sink:UOp) -> UOp:
 
   # The tensor replacement map is collected before these rewrites change node identities.
   graph_rewrite(big_sink, pm_callify_ctx_collect, ctx=(ctx:=CallifyCtx()), name="early transform tensor graph")
+  # Aliased views must stay rooted in one PARAM so scheduling can detect overlapping reads and writes.
+  if ctx.views:
+    inputs:set[UOp] = set()
+    def collect_input(u:UOp):
+      if u.op is not Ops.BUFFER and u not in ctx.views: return True
+      inputs.add(u)
+      return False
+    UOp.sink(*ctx.stores).toposort(gate=collect_input, enter_calls=False)
+    bases = Counter(u.storage_base for u in inputs)
+    ctx.views = {u for u in ctx.views if bases[u.storage_base] == 1}
   ret = graph_rewrite(UOp.sink(*ctx.stores), pm_canonicalize_alloc+pm_replace_buf+remove_all_tags, ctx=ctx, bottom_up=True, name="replace bufs")
   ret = ret.call(*ctx.replacements, precompile=True)
   if VIZ: graph_rewrite(ret, PatternMatcher([]), name="View Call")
