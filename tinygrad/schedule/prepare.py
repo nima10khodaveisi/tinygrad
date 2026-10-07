@@ -76,8 +76,8 @@ def _mop_index(r:UOp, idx:UOp):
 pm_mops = PatternMatcher([
   # handle movement ops on INDEX
   (UPat(GroupOp.Movement, name="r").f(Ops.INDEX, allow_any_len=True, name="idx"), _mop_index),
-  # move movement ops and INDEX after AFTER
-  (UPat(GroupOp.Movement|{Ops.INDEX}, name="r").after(name="a", allow_any_len=True),
+  # move movement ops, INDEX and BITCAST after AFTER
+  (UPat(GroupOp.Movement|{Ops.INDEX, Ops.BITCAST}, name="r").after(name="a", allow_any_len=True),
    lambda r,a: UOp(r.op, src=(a.replace(src=(r.src[0],)+a.src[1:]),)+r.src[1:], arg=r.arg)),
   (UPat(GroupOp.Movement, name="r").end(name="a", allow_any_len=True), lambda r,a: a.replace(src=(r.src[0],)+a.src[1:])),
 ])
@@ -92,7 +92,9 @@ def store_hazard_boundary(s:UOp):
   return True
 
 def fix_store_hazard(target:UOp, src:UOp):
-  if (base:=target.base) not in src.toposort(enter_calls=False): return None
+  base = target.base
+  while base.op is Ops.BITCAST: base = base.src[0].base
+  if base not in src.toposort(enter_calls=False): return None
   # PERMUTE and FLIP reorder indices, SHRINK can have overlapping regions when dest is also shrunk
   unsafe = {Ops.PERMUTE, Ops.FLIP} | ({Ops.SHRINK} if target.op_in_backward_slice_with_self(Ops.SHRINK) else set())
   reaches_base: dict[UOp, bool] = {}

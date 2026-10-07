@@ -56,6 +56,17 @@ def _test_bitcasted(t: Tensor, dt: DType, expected):
 
 # sudo su -c 'sync; echo 1 > /proc/sys/vm/drop_caches' && python3 test/runtime/test_disk_tensor.py TestRawDiskBuffer.test_readinto_read_speed
 class TestRawDiskBuffer(unittest.TestCase):
+  def test_copy_shared_typed_views(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      path = pathlib.Path(tmp) / "weights"
+      path.write_bytes(np.arange(16, dtype=np.float32).tobytes())
+      raw = Tensor(path)
+      a = raw[:32].bitcast(dtypes.float32).to(Device.DEFAULT)
+      b = raw[16:48].bitcast(dtypes.float32).to(Device.DEFAULT)
+      Tensor.realize(a, b)
+      self.assertEqual(a.tolist(), list(range(8)))
+      self.assertEqual(b.tolist(), list(range(4, 12)))
+
   @unittest.skipIf(not test_fn.exists(), "download LLaMA weights for read in speed tests")
   def test_readinto_read_speed(self):
     tst = np.empty(test_size, np.uint8)

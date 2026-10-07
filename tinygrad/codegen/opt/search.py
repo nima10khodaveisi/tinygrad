@@ -38,7 +38,8 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
   if allow_test_size and max_global_size is not None:
     global_size, factor = get_test_global_size(prg.arg.global_size, max_global_size, var_vals)
     prg = prg.replace(arg=replace(prg.arg, global_size=tuple(global_size)))
-  call = prg.call(*[UOp.from_buffer(b) for b in rawbufs])
+  params = {p.arg.slot:p for p in prg.src[0].backward_slice if p.op is Ops.PARAM}
+  call = prg.call(*[UOp.from_buffer(b, params[i].dtype) for i,b in enumerate(rawbufs)])
   tms, timer = [], time_call(call, var_vals, timeout=timeout, clear_l2=clear_l2)
   for _ in range(cnt):
     try: tms.append(next(timer) * factor)

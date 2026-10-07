@@ -1,7 +1,7 @@
 import time, inspect
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field, replace
-from tinygrad.dtype import AddrSpace
+from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.uop.ops import GroupOp, remove_all_tags, UOp, Ops, UOpMetaClass, graph_rewrite, gate_kernel_sink, KernelInfo
 from tinygrad.uop.spec import type_verify, spec_tensor
 from tinygrad.helpers import DEBUG, cpu_profile, TracingKey, SPEC, SCACHE, BASEDIR, partition, dedup, all_int, VIZ
@@ -78,7 +78,7 @@ def create_schedule(sched_sink:UOp) -> UOp:
     if any(in_degree.values()): raise RuntimeError("cycle detected in assign graph")
   return UOp(Ops.LINEAR, src=tuple(linearized))
 
-from tinygrad.schedule.memory import memory_plan_rewrite
+from tinygrad.schedule.memory import memory_plan_rewrite, _collect_bufs
 from tinygrad.engine.realize import capturing, pm_flatten_linear
 from tinygrad.schedule.prepare import prepare_rangeify
 from tinygrad.schedule.multi import multi_pm
@@ -199,13 +199,14 @@ def contiguous_mops_to_view(ctx:CallifyCtx|None, c:UOp, src:UOp):
   if not all_int(c.shape): return None
   buf = src.base
   while buf.op is Ops.BITCAST: buf = buf.src[0].base
+  if c.op is Ops.STORE and src.dtype == buf.dtype: return None
   if buf.op is Ops.UNSHARD:
     if isinstance(c.device, str): return None
     if (unshard := graph_rewrite(src, multi_pm, name="multi_buffer_view")).op is not Ops.UNSHARD: return None
     view = contiguous_mops_to_view(ctx, unshard.src[0], unshard.src[0])
     return None if view is None else view.unshard(unshard.arg, unshard.src[1:])
 
-  if buf.op is not Ops.BUFFER or (cv := src.contiguous_view()) is None or cv[0].op is not Ops.BUFFER: return None
+  if buf.op is not Ops.BUFFER or (cv := src.contiguous_view()) is None or cv[0].storage_base.op is not Ops.BUFFER: return None
   buf, offset = cv
   view = buf[offset:offset + src.max_numel() * src.element_size() // buf.element_size()].bitcast(src.dtype)
   if ctx is not None: ctx.views.add(view)
@@ -222,7 +223,7 @@ def collect_stores(ctx:CallifyCtx, u:UOp):
 pm_callify_ctx_collect = PatternMatcher([
   # fold MOPS+BITCAST over BUFFER into SHRINK when movement ops collapse to contiguous range
   (UPat((Ops.COPY, Ops.STAGE), src=(UPat(GroupOp.Movement|{Ops.BITCAST}, name="src"),), allow_any_len=True, name="c"), contiguous_mops_to_view),
-  (UPat(Ops.STORE, src=(UPat(Ops.BITCAST, name="src"), UPat()), name="c", allow_any_len=True), contiguous_mops_to_view),
+  (UPat(Ops.STORE, src=(UPat(GroupOp.Movement|{Ops.BITCAST}, name="src"), UPat()), name="c", allow_any_len=True), contiguous_mops_to_view),
 
   # Collect effects after their sources have been rewritten, without entering call bodies.
   (UPat(Ops.AFTER, name="u"), collect_stores),
@@ -260,10 +261,44 @@ def transform_to_call(big_sink:UOp) -> UOp:
   if VIZ: graph_rewrite(big_sink, PatternMatcher([]), name="View Graph")
   if SPEC: type_verify(big_sink, spec_tensor)
 
+  # Narrow writes need an addressable byte root, not a value bitcast that expands into shifts and casts.
+  byte_roots, byte_stacks = {}, {}
+  for u in big_sink.toposort(enter_calls=False):
+    if u.op is not Ops.STORE: continue
+    storage = u.src[0].storage_base.toposort(enter_calls=False)
+    # Keep typed shards addressable too: MSTACK otherwise materializes its BITCAST sources.
+    typed_stacks = [s for s in storage if s.op is Ops.MSTACK and any(t.op is Ops.BITCAST for t in s.src)]
+    for s in typed_stacks:
+      if s.dtype is not dtypes.uint8: byte_stacks[s] = s.replace(src=tuple(t.bitcast(dtypes.uint8) for t in s.src)).bitcast(s.dtype)
+    itemsize = 1 if typed_stacks else u.src[0].dtype.itemsize
+    view = u.src[0]
+    while view.op in GroupOp.Movement|{Ops.BITCAST, Ops.AFTER, Ops.UNSHARD}:
+      itemsize = min(itemsize, view.dtype.itemsize)
+      view = view.src[0]
+    for b in storage:
+      if b.op is Ops.BUFFER and b.arg.buffer is not None and itemsize < b.dtype.itemsize:
+        byte_roots[b] = b.replace(src=(UOp.const(b.arg.buffer.nbytes),)+b.src[1:], arg=replace(b.arg, dtype=dtypes.uint8)).bitcast(b.dtype)
+  if byte_stacks: big_sink = big_sink.substitute(byte_stacks, walk=True)
+  if byte_roots: big_sink = big_sink.substitute(byte_roots, walk=True).simplify()
+
   # The tensor replacement map is collected before these rewrites change node identities.
   graph_rewrite(big_sink, pm_callify_ctx_collect, ctx=(ctx:=CallifyCtx()), name="early transform tensor graph")
+  # Written aliases must stay rooted in one PARAM so scheduling can detect overlapping reads and writes.
+  if ctx.views:
+    inputs:set[UOp] = set()
+    def collect_input(u:UOp):
+      if u.op is not Ops.BUFFER and u not in ctx.views: return True
+      inputs.add(u)
+      return False
+    UOp.sink(*(s for u in ctx.stores for s in u.src[1:])).toposort(gate=collect_input, enter_calls=False)
+    bases = Counter(u.storage_base for u in inputs)
+    written = {u.src[0].storage_base for u in UOp.sink(*ctx.stores).toposort(enter_calls=False)
+               if u.op is Ops.STORE and u.src[0].storage_base in u.src[1].toposort(enter_calls=False)}
+    ctx.views = {u for u in ctx.views if bases[u.storage_base] == 1 or u.storage_base not in written}
   ret = graph_rewrite(UOp.sink(*ctx.stores), pm_canonicalize_alloc+pm_replace_buf+remove_all_tags, ctx=ctx, bottom_up=True, name="replace bufs")
-  ret = ret.call(*ctx.replacements, precompile=True)
+  # Byte parameters describe the compiler interface; call arguments keep the original storage roots for JIT binding.
+  bindings = {v.src[0]: b.bitcast(dtypes.uint8) for b,v in byte_roots.items()}
+  ret = ret.call(*(b.substitute(bindings, walk=True) for b in ctx.replacements), precompile=True)
   if VIZ: graph_rewrite(ret, PatternMatcher([]), name="View Call")
   return ret
 
@@ -294,5 +329,5 @@ def create_linear_with_vars(big_sink:UOp) -> tuple[UOp, dict[str, int]]:
     capturing[0].add_linear(linear)
     return UOp(Ops.LINEAR, src=()), var_vals
 
-  held_bufs = {b for b in linear_call.src[1:] if b.op is Ops.BUFFER}
+  held_bufs = {b for arg in linear_call.src[1:] for b in _collect_bufs(arg)}
   return memory_plan_rewrite(linear, held_bufs), var_vals

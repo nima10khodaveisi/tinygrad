@@ -45,7 +45,8 @@ class ParamArg:
               ("volatile", False), ("image", None), ("bind_on_realize", False), ("val", None), ("spec", None))
     args = [repr(self.slot), repr(self.dtype)] + [f"{k}={v!r}" for k,default in fields if (v:=getattr(self, k)) != default]
     if self.buffer is not None:
-      args.append(f"buffer=UOp.new_buffer({self.device!r}, {self.buffer.size}, {self.dtype!r}, {self.slot}).buffer")
+      size = self.buffer.nbytes//self.dtype.itemsize
+      args.append(f"buffer=UOp.new_buffer({self.device!r}, {size}, {self.dtype!r}, {self.slot}).buffer")
     return f"ParamArg({', '.join(args)})"
 axis_letters = {AxisType.DEVICE: "d", AxisType.GLOBAL: "g", AxisType.LOCAL: "l", AxisType.WARP: "w", AxisType.WEAK: "L",
                 AxisType.LOOP: "L", AxisType.UPCAST: "u"}
@@ -187,10 +188,14 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
 
 class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
+  buffer_uops:weakref.WeakValueDictionary[tuple[Buffer, str], UOp] = weakref.WeakValueDictionary()
   def __call__(cls, op:Ops, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None, metadata:tuple[Metadata,...]|None=None):
     # NOTE: the key must separate nodes of different dtype: a CONST's dtype is the type of its arg, and True == 1 as dict keys
     if (wret:=UOpMetaClass.ucache.get(key:=(op, src, arg, tag, type(arg)), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(op, src, arg, tag))
+    if op is Ops.BUFFER and arg.buffer is not None and tag is None:
+      for b,d in zip(arg.buffer.bufs if isinstance(arg.buffer, MultiBuffer) else [arg.buffer], to_tuple(arg.device)):
+        UOpMetaClass.buffer_uops.setdefault((b, d), created)
     if metadata is not None: all_metadata[created] = metadata
     if SPEC > 1:
       from tinygrad.uop.spec import spec_full
@@ -832,13 +837,29 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if dtype in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {dtype}")
     assert isinstance(size, int), f"new_buffer size must be a concrete int, got {size}"
     slot = next(UOp.unique_num) if num is None else num
-    buf = MultiBuffer(device, size, dtype) if isinstance(device, tuple) else Buffer(device, size, dtype)
+    buf = MultiBuffer(device, size * dtype.itemsize) if isinstance(device, tuple) else Buffer(device, size * dtype.itemsize)
     return UOp(Ops.BUFFER, src=(UOp.const(size),)+UOp.device_range_src(device), arg=ParamArg(slot, dtype, device=device, buffer=buf))
   @staticmethod
-  def from_buffer(opaque:Buffer|MultiBuffer, device:str|tuple[str, ...]|None=None):
-    # the opaque Buffer goes straight in the arg: the ucache dedups because the arg (and thus the Buffer) is part of the key
-    return UOp(Ops.BUFFER, src=(UOp.const(opaque.size),)+UOp.device_range_src(device or opaque.device),
-               arg=ParamArg(-id(opaque), opaque.dtype, device=device or opaque.device, buffer=opaque))
+  def from_buffer(opaque:Buffer|MultiBuffer, dtype:DType, device:str|tuple[str, ...]|None=None):
+    assert dtype not in dtypes.weaks and dtype.itemsize > 0 and opaque.nbytes % dtype.itemsize == 0, \
+      f"cannot interpret {opaque.nbytes} bytes as {dtype}"
+    device = device or opaque.device
+    if isinstance(opaque, MultiBuffer):
+      assert isinstance(device, tuple) and len(device) == len(opaque.bufs)
+      shards = tuple(UOp.from_buffer(b, dtypes.uint8, d) for b,d in zip(opaque.bufs, device))
+      roots = tuple(s.src[0] if s.op is Ops.BITCAST else s for s in shards)
+      if all(s.op is Ops.MSELECT and s.arg == i and s.src == roots[0].src for i,s in enumerate(roots)) and roots[0].src[0].device == device:
+        return roots[0].src[0].bitcast(dtype)
+      return UOp(Ops.MSTACK, src=roots if all_same([s.dtype for s in roots]) else shards).bitcast(dtype)
+    assert isinstance(device, str)
+    if opaque.base is not opaque:
+      return UOp.from_buffer(opaque.base, dtypes.uint8, device)[opaque.offset:opaque.offset+opaque.nbytes].bitcast(dtype)
+    # Reuse the live graph's storage root, including roots created by new_buffer. Types are views of that root.
+    if (root := UOpMetaClass.buffer_uops.get((opaque, device))) is not None:
+      if isinstance(root.arg.buffer, MultiBuffer): root = root.mselect(root.arg.buffer.bufs.index(opaque))
+      return root.bitcast(dtype)
+    return UOp(Ops.BUFFER, src=(UOp.const(opaque.nbytes//dtype.itemsize),)+UOp.device_range_src(device),
+               arg=ParamArg(-id(opaque), dtype, device=device, buffer=opaque))
   def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
     device = canonicalize_device(self.device if device is None else device)
     axis = self.axis if isinstance(device, tuple) else None
@@ -936,6 +957,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     """Check if this UOp has a storage identity in the graph, whether or not its buffer is bound."""
     # TODO: this is confusing because UOp.variable('v', 0, 1, dtypes.weakfloat) is True for jit to work, but it doesn't have a buffer
     if self.op in {Ops.RESHAPE, Ops.UNSHARD, Ops.MSELECT}: return self.src[0].has_buffer_identity(after_ok)
+    if self.op is Ops.MSTACK: return all(s.storage_base.has_buffer_identity(after_ok) for s in self.src)
     if after_ok and self.op == Ops.AFTER: return self.src[0].has_buffer_identity(after_ok)
     return self.op in GroupOp.Defines
 
@@ -955,16 +977,16 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   def buffer(self) -> Buffer|MultiBuffer:
     # a bare STAGE (same-device materialization) keeps the source's buffer
     if self.op is Ops.STAGE and self.arg is None: return self.src[0].buffer
-    if self.op in {Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER}: return self.src[0].buffer
+    if self.op in {Ops.CONTIGUOUS_BACKWARD, Ops.RESHAPE, Ops.UNSHARD, Ops.DETACH, Ops.AFTER, Ops.BITCAST}: return self.src[0].buffer
     # this buffer can process disk tensors and simple movement ops.
     # NOTE: the view Buffer returned here is transient (short-lived), it only wraps an offset into the base BUFFER's storage
-    if self is not self.base or self.op is Ops.BITCAST:
+    if self is not self.base:
       src, offset = self._buffer_view
       if isinstance(buf:=src.buffer, MultiBuffer):
         mbuf = MultiBuffer.__new__(MultiBuffer)
-        mbuf.bufs = [x.view(prod(self.max_shape), self.dtype, offset) for x in buf.bufs]
+        mbuf.bufs = [x.view(prod(self.max_shape) * self.dtype.itemsize, offset) for x in buf.bufs]
         return mbuf
-      return buf.view(prod(self.max_shape), self.dtype, offset)
+      return buf.view(prod(self.max_shape) * self.dtype.itemsize, offset)
     if self.op is Ops.MSELECT:
       ret = self.src[0].buffer
       assert isinstance(ret, MultiBuffer)
@@ -972,7 +994,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op is Ops.MSTACK:
       ret = MultiBuffer.__new__(MultiBuffer)
       ret.bufs = [cast(Buffer, x.buffer) for x in self.src]
-      assert all_same([(x.size, x.dtype) for x in ret.bufs]), "multibuffers mismatch buffers"
+      assert all_same([(b.nbytes, u.dtype) for b,u in zip(ret.bufs, self.src)]), "multibuffers mismatch buffers"
       return ret
     assert self.op is Ops.BUFFER and self.arg.buffer is not None, f"must be a realized BUFFER {self}"
     return self.arg.buffer
