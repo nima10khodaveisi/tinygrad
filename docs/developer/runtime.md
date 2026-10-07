@@ -24,6 +24,11 @@ The `Compiled` class is responsible for initializing and managing a device.
 
 The `Allocator` class manages memory on the device and caches allocated buffers for reuse.
 
+`Buffer(device, nbytes)` owns untyped storage. Its length and view offsets are in bytes:
+`buffer.view(nbytes, offset)` shares a byte range of the original allocation. Allocators may reserve additional padding internally.
+The graph retains element counts and dtypes; `UOp.from_buffer(buffer, dtype)` gives storage a typed interpretation without converting its contents.
+Use `buffer.numpy(dtype)` for typed host reads and `buffer.copy_from(source)` for byte copies.
+
 ::: tinygrad.device.Allocator
     options:
         members: true

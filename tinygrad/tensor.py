@@ -247,7 +247,7 @@ class Tensor(RandMixin):
 
     # TODO: this is a hack for writing to DISK. remove with working assign
     if is_disk:
-      (b:=self._buffer()).copy_from(Buffer("PYTHON", b.size, b.dtype, opaque=x._data()))
+      (b:=self._buffer()).copy_from(Buffer("PYTHON", b.nbytes, opaque=x._data()))
       return self
     assigned_to = self.uop.storage_base
     # assigning to a value is initialization, not a write: the whole tensor is overwritten, so the pending value is dead.
@@ -297,8 +297,8 @@ class Tensor(RandMixin):
     if 0 in self.shape: return memoryview(bytearray(0)).cast(self.dtype.fmt)  # type: ignore[arg-type,return-value]
     assert all_int(self.shape), f"no data if shape is symbolic, {self.shape=}"
     buf = self._buffer()
-    fmt = buf.dtype.fmt
-    assert fmt is not None, f"no fmt dtype for {buf.dtype}"
+    fmt = self.dtype.fmt
+    assert fmt is not None, f"no fmt dtype for {self.dtype}"
     assert fmt != "e" or sys.version_info >= (3, 12)
     return buf.as_memoryview().cast(fmt, self.shape)  # type: ignore[arg-type,return-value]
 
@@ -339,7 +339,7 @@ class Tensor(RandMixin):
     import numpy as np
     if self.dtype in { dtypes.bfloat16, *dtypes.fp8s }: return self.float().numpy()
     if 0 in self.shape: return np.empty(self.shape, dtype=_to_np_dtype(self.dtype))
-    return self._buffer().numpy().reshape(self.shape)
+    return self._buffer().numpy(self.dtype).reshape(self.shape)
 
   def clone(self, device:str|tuple[str, ...]|None=None) -> Tensor:
     """

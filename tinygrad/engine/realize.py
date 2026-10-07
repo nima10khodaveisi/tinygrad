@@ -172,7 +172,9 @@ def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
     cpu_rt = get_runtime("CPU", prg:=to_program(ast.src[0], Device["CPU"].renderer))
     global_size, local_size = prg.arg.launch_dims(var_vals)
     cpu_rt(*[bufs[i].ensure_allocated()._buf for i in prg.arg.globals], global_size=global_size, local_size=local_size, vals=prg.arg.vals(var_vals))
-    for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), bufs[i].numpy(), rtol=1e-3, atol=1e-3)
+    for i in prg.arg.outs:
+      dtype = call.src[1+i].dtype
+      np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(dtype), bufs[i].numpy(dtype), rtol=1e-3, atol=1e-3)
   return []
 
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:

@@ -26,7 +26,7 @@ def compile_net(linear:UOp, output_bufs:List[Buffer]) -> Tuple[Dict[str,str], Li
     if bu.op is Ops.PARAM: key, name, size = ("in", bu.arg.slot), f"input{bu.arg.slot}", prod(bu.shape)*bu.dtype.itemsize
     else:
       b = bu.buffer
-      key, size = (id(b.base), b.offset, b.size, b.dtype), b.size*b.dtype.itemsize
+      key, size = (id(b.base), b.offset, b.nbytes, bu.dtype), b.nbytes
       if key in bufs: return bufs[key][0]
       if (name:=output_name.get(id(b))) is None:
         name, n = f"buf_{n}", n+1

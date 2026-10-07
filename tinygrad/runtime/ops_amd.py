@@ -672,7 +672,7 @@ class KFDIface:
                    xcc_id=0, idx=0):
     if not hasattr(self, 'queue_event_arr'):
       if not hasattr(KFDIface, 'event_page'):
-        KFDIface.event_page = Buffer(self.dev.device, 0x8000, dtypes.uint8, options=BufferSpec(uncached=True), preallocate=True)
+        KFDIface.event_page = Buffer(self.dev.device, 0x8000, options=BufferSpec(uncached=True), preallocate=True)
         kfd.AMDKFD_IOC_CREATE_EVENT(KFDIface.kfd, event_page_offset=KFDIface.event_page.meta.handle)
 
       KFDIface.event_page.get_buf(self.dev.device)
@@ -690,11 +690,11 @@ class KFDIface:
       self.doorbells_base = queue.doorbell_offset & (~0x1fff) # doorbell is two pages
       self.doorbells = cast(FileIOInterface, KFDIface.kfd).mmap(0, 0x2000, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED, self.doorbells_base)
 
-    (put_value := Buffer("CPU", 1, dtypes.uint64, preallocate=True)).host.view(fmt='Q')[0] = 0
-    doorbell = Buffer("CPU", 1, dtypes.uint64,
+    (put_value := Buffer("CPU", 8, preallocate=True)).host.view(fmt='Q')[0] = 0
+    doorbell = Buffer("CPU", 8,
       options=BufferSpec(external_ptr=self.doorbells + queue.doorbell_offset - self.doorbells_base), preallocate=True)
-    return AMDQueueDesc(ring=ring, doorbell=doorbell, read_ptr=gart.view(1, dtypes.uint64, rptr+8*xcc_id).ensure_allocated(),
-      write_ptr=gart.view(1, dtypes.uint64, wptr).ensure_allocated(), put_value=put_value, eop_buffer=eop_buffer, cwsr_buffer=cwsr_buffer)
+    return AMDQueueDesc(ring=ring, doorbell=doorbell, read_ptr=gart.view(8, rptr+8*xcc_id).ensure_allocated(),
+      write_ptr=gart.view(8, wptr).ensure_allocated(), put_value=put_value, eop_buffer=eop_buffer, cwsr_buffer=cwsr_buffer)
 
   def sleep(self, tm:int):
     kfd.AMDKFD_IOC_WAIT_EVENTS(KFDIface.kfd, events_ptr=ctypes.addressof(self.queue_event_arr), num_events=3, wait_for_all=0, timeout=tm)
@@ -775,10 +775,10 @@ class PCIIface(PCIIfaceBase):
       doorbell_index = self.dev_impl.gfx.setup_ring(*(rcvr_params:=(ring._buf, ring.nbytes, gart._buf+rptr,
         gart._buf+wptr, eop_buffer._buf, eop_buffer.nbytes, is_aql:=(queue_type==kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL), is_aql)))
 
-    put_value = Buffer(host:=self.dev.host, 1, dtypes.uint64, initial_value=bytes(8))
-    doorbell = Buffer(host, 1, dtypes.uint64, options=BufferSpec(external_ptr=self.dev_impl.doorbell64.addr + doorbell_index*8), preallocate=True)
-    return AMDQueueDesc(ring=ring, doorbell=doorbell, read_ptr=gart.view(1, dtypes.uint64, rptr).ensure_allocated(),
-      write_ptr=gart.view(1, dtypes.uint64, wptr).ensure_allocated(), put_value=put_value, eop_buffer=eop_buffer, params=rcvr_params)
+    put_value = Buffer(host:=self.dev.host, 8, initial_value=bytes(8))
+    doorbell = Buffer(host, 8, options=BufferSpec(external_ptr=self.dev_impl.doorbell64.addr + doorbell_index*8), preallocate=True)
+    return AMDQueueDesc(ring=ring, doorbell=doorbell, read_ptr=gart.view(8, rptr).ensure_allocated(),
+      write_ptr=gart.view(8, wptr).ensure_allocated(), put_value=put_value, eop_buffer=eop_buffer, params=rcvr_params)
 
   def _collect_interrupts(self, reset=False, drain_only=False):
     d = self.dev
@@ -826,7 +826,7 @@ class USBIface(PCIIface):
     for off, paddr, n in pieces: self.dev_impl.mm.map_range(vaddr + off, n, [(paddr, n)], aspace=AddrSpace.SYS, uncached=True)
     view = self.pci_dev.dma_view(0xa000, 0x85000)
     for off, n in ((0x800, 4), (0x5000, 0x80000)): view.view(off, n)[:] = bytes(n) # no stale fence or sentinel
-    return Buffer(self.dev.device, 0x85000, dtypes.uint8, options=BufferSpec(external_ptr=vaddr), opaque=BufferStorage(vaddr, host=view))
+    return Buffer(self.dev.device, 0x85000, options=BufferSpec(external_ptr=vaddr), opaque=BufferStorage(vaddr, host=view))
 
   def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
             **kwargs) -> BufferStorage:
@@ -918,8 +918,8 @@ class AMDDevice(Compiled):
 
   def create_queue(self, queue_type, ring_size, ctx_save_restore_size=0, eop_buffer_size=0, ctl_stack_size=0, debug_memory_size=0, idx=0):
     spec = BufferSpec(host=True, uncached=True, cpu_access=True)
-    ring = Buffer(self.device, ring_size // 4, dtypes.uint32, options=spec, preallocate=True, allocator=self.allocator)
-    gart = Buffer(self.device, 0x100, dtypes.uint8, options=spec, initial_value=bytes(0x100), allocator=self.allocator)
+    ring = Buffer(self.device, ring_size, options=spec, preallocate=True, allocator=self.allocator)
+    gart = Buffer(self.device, 0x100, options=spec, initial_value=bytes(0x100), allocator=self.allocator)
 
     if queue_type == kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL:
       self.aql_gart = gart
@@ -930,8 +930,8 @@ class AMDDevice(Compiled):
       else: self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
     cwsr_buffer_size = round_up((ctx_save_restore_size + debug_memory_size) * self.xccs, mmap.PAGESIZE)
-    cwsr_buffer = Buffer(self.device, cwsr_buffer_size, dtypes.uint8, preallocate=True, allocator=self.allocator) if ctx_save_restore_size else None
-    eop_buffer = Buffer(self.device, eop_buffer_size, dtypes.uint8, preallocate=True, allocator=self.allocator) if eop_buffer_size else None
+    cwsr_buffer = Buffer(self.device, cwsr_buffer_size, preallocate=True, allocator=self.allocator) if ctx_save_restore_size else None
+    eop_buffer = Buffer(self.device, eop_buffer_size, preallocate=True, allocator=self.allocator) if eop_buffer_size else None
 
     return self.iface.create_queue(queue_type, ring, gart, rptr=getattr(hsa.amd_queue_t, 'read_dispatch_id').offset,
              wptr=getattr(hsa.amd_queue_t, 'write_dispatch_id').offset, eop_buffer=eop_buffer, cwsr_buffer=cwsr_buffer,
@@ -990,7 +990,7 @@ class AMDDevice(Compiled):
       mem_alignment_size = 256 if self.target[0] != 9 else 1024
       size_per_thread = round_up(private_segment_size, mem_alignment_size // lanes_per_wave)
       size_per_xcc = size_per_thread * lanes_per_wave * self.iface.props['max_slots_scratch_cu'] * self.cu_cnt
-      self.scratch = Buffer(self.device, size_per_xcc * self.xccs, dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+      self.scratch = Buffer(self.device, size_per_xcc * self.xccs, options=BufferSpec(nolru=True), preallocate=True)
       self.max_private_segment_size = private_segment_size
       if hasattr(self, 'aql_desc'): self.aql_scratch()
     return self.scratch
@@ -1010,25 +1010,26 @@ class AMDDevice(Compiled):
     self.aql_desc.compute_tmpring_size = self.tmpring_size(self.max_private_segment_size)
     self.aql_gart.host.view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
-  def _prof_buffer(self, size:int, dtype, host:bool=True) -> Buffer:
-    buf = Buffer(self.device, size, dtype, options=BufferSpec(host=host, nolru=True, uncached=host, cpu_access=True), preallocate=True)
+  def _prof_buffer(self, nbytes:int, host:bool=True) -> Buffer:
+    buf = Buffer(self.device, nbytes, options=BufferSpec(host=host, nolru=True, uncached=host, cpu_access=True), preallocate=True)
     buf.host.view(fmt='B')[:buf.nbytes] = bytes(buf.nbytes)
     return buf
 
   @functools.cached_property
-  def prof_log(self) -> Buffer: return self._prof_buffer(1 + self.prof_slots, dtypes.uint64)
+  def prof_log(self) -> Buffer: return self._prof_buffer((1 + self.prof_slots) * 8)
   @property
   def pmc_size(self) -> int: return self.pmc_sched[-1].off + self.pmc_sched[-1].size
   @functools.cached_property
-  def pmc_buf(self) -> Buffer: return self._prof_buffer(self.pmc_size * self.prof_slots, dtypes.uint8)
+  def pmc_buf(self) -> Buffer: return self._prof_buffer(self.pmc_size * self.prof_slots)
   @functools.cached_property
-  def sqtt_buf(self) -> Buffer: return self._prof_buffer(self.sqtt_win * self.prof_slots * self.sqtt_ses, dtypes.uint8, host=False)
+  def sqtt_buf(self) -> Buffer: return self._prof_buffer(self.sqtt_win * self.prof_slots * self.sqtt_ses, host=False)
   @functools.cached_property
-  def sqtt_wptrs(self) -> Buffer: return self._prof_buffer(self.prof_slots * self.sqtt_ses, dtypes.uint32)
+  def sqtt_wptrs(self) -> Buffer: return self._prof_buffer(self.prof_slots * self.sqtt_ses * 4)
 
   def program_buffer(self, b:UOp) -> Buffer:
     if b not in self.prog_bufs:
-      buf = self.prog_bufs[b] = Buffer(self.device, b.max_numel(), b.dtype, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
+      buf = self.prog_bufs[b] = Buffer(self.device, b.max_numel() * b.dtype.itemsize,
+                                       options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
       if PROFILE:
         name, lib, key = _amd_program_prof[b]
         Compiled.profile_events.append(ProfileProgramEvent(self.device, name, lib, buf._buf, b.arg.slot, key))

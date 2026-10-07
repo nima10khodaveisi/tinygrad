@@ -835,13 +835,15 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if dtype in dtypes.weaks: raise RuntimeError(f"cannot create storage for weak dtype {dtype}")
     assert isinstance(size, int), f"new_buffer size must be a concrete int, got {size}"
     slot = next(UOp.unique_num) if num is None else num
-    buf = MultiBuffer(device, size, dtype) if isinstance(device, tuple) else Buffer(device, size, dtype)
+    buf = MultiBuffer(device, size * dtype.itemsize) if isinstance(device, tuple) else Buffer(device, size * dtype.itemsize)
     return UOp(Ops.BUFFER, src=UOp.device_range_src(device), arg=ParamArg(slot, dtype, size=size, device=device, buffer=buf))
   @staticmethod
-  def from_buffer(opaque:Buffer|MultiBuffer, device:str|tuple[str, ...]|None=None):
+  def from_buffer(opaque:Buffer|MultiBuffer, dtype:DType, device:str|tuple[str, ...]|None=None):
     # the opaque Buffer goes straight in the arg: the ucache dedups because the arg (and thus the Buffer) is part of the key
+    assert dtype not in dtypes.weaks and dtype.itemsize > 0 and opaque.nbytes % dtype.itemsize == 0, \
+      f"cannot interpret {opaque.nbytes} bytes as {dtype}"
     return UOp(Ops.BUFFER, src=UOp.device_range_src(device or opaque.device),
-               arg=ParamArg(-id(opaque), opaque.dtype, size=opaque.size, device=device or opaque.device, buffer=opaque))
+               arg=ParamArg(-id(opaque), dtype, size=opaque.nbytes//dtype.itemsize, device=device or opaque.device, buffer=opaque))
   def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
     device = canonicalize_device(self.device if device is None else device)
     axis = self.axis if isinstance(device, tuple) else None
@@ -965,9 +967,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
       src, offset = self._buffer_view
       if isinstance(buf:=src.buffer, MultiBuffer):
         mbuf = MultiBuffer.__new__(MultiBuffer)
-        mbuf.bufs = [x.view(prod(self.max_shape), self.dtype, offset) for x in buf.bufs]
+        mbuf.bufs = [x.view(prod(self.max_shape) * self.dtype.itemsize, offset) for x in buf.bufs]
         return mbuf
-      return buf.view(prod(self.max_shape), self.dtype, offset)
+      return buf.view(prod(self.max_shape) * self.dtype.itemsize, offset)
     if self.op is Ops.MSELECT:
       ret = self.src[0].buffer
       assert isinstance(ret, MultiBuffer)
@@ -975,7 +977,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     if self.op is Ops.MSTACK:
       ret = MultiBuffer.__new__(MultiBuffer)
       ret.bufs = [cast(Buffer, x.buffer) for x in self.src]
-      assert all_same([(x.size, x.dtype) for x in ret.bufs]), "multibuffers mismatch buffers"
+      assert all_same([(b.nbytes, u.dtype) for b,u in zip(ret.bufs, self.src)]), "multibuffers mismatch buffers"
       return ret
     assert self.op is Ops.BUFFER and self.arg.buffer is not None, f"must be a realized BUFFER {self}"
     return self.arg.buffer

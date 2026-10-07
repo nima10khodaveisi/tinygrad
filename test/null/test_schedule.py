@@ -123,13 +123,13 @@ class TestContiguous(unittest.TestCase):
     a = Tensor.empty(4)
     b = a.expand((4, 4))
     check_schedule(b, 0)
-    self.assertEqual(b.uop.base.buffer.size, 4)
+    self.assertEqual(b.uop.base.buffer.nbytes, 4 * b.dtype.itemsize)
 
   def test_contiguous_view_realizes(self):
     a = Tensor.empty(4)
     b = a.expand((4, 4)).contiguous()
     check_schedule(b, 1)
-    self.assertEqual(b.uop.base.buffer.size, 16)
+    self.assertEqual(b.uop.base.buffer.nbytes, 16 * b.dtype.itemsize)
 
 class TestSimpleSchedule(unittest.TestCase):
   def test_reduce_doesnt_split(self):
@@ -1812,7 +1812,7 @@ class TestUOpBecome(unittest.TestCase):
     a = Tensor.empty(4, 1)
     b = a.expand(4, 4).reciprocal()
     check_schedule(b, 1)
-    self.assertEqual(b.uop.base.buffer.size, 4)
+    self.assertEqual(b.uop.base.buffer.nbytes, 4 * b.dtype.itemsize)
     self.assertEqual(b.uop.shape, (4, 4))
 
   def test_reorder_expand_alt(self):
