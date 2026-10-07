@@ -1,6 +1,6 @@
 import unittest, struct, pickle, weakref, gc
 from tinygrad import Tensor, TinyJit, dtypes
-from tinygrad.device import Buffer
+from tinygrad.device import Buffer, MultiBuffer
 from tinygrad.engine.jit import JitError
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp
@@ -89,6 +89,42 @@ class TestBuffer(unittest.TestCase):
   def test_invalid_interpretation(self):
     for dt in (dtypes.uint32, dtypes.void, dtypes.weakint, dtypes.weakfloat):
       with self.subTest(dtype=dt), self.assertRaises(AssertionError): UOp.from_buffer(Buffer("CPU", 3), dt)
+
+  def test_byte_view_write(self):
+    for dtype in (dtypes.uint8, dtypes.uint16, dtypes.uint32, dtypes.float32):
+      for offset in (1, 4):
+        for overlap in (False, True):
+          with self.subTest(dtype=dtype, offset=offset, overlap=overlap):
+            b = Buffer("CPU", 16, initial_value=bytes(range(16)))
+            root = UOp.from_buffer(b, dtype)
+            view = Tensor(UOp.from_buffer(b.view(8, offset), dtypes.uint8))
+            src = Tensor(UOp.from_buffer(b.view(8, 0), dtypes.uint8)) if overlap else Tensor([42]*8, device="CPU", dtype=dtypes.uint8)
+            view.assign(src).realize()
+            self.assertEqual(list(b.as_memoryview()), list(range(offset)) + (list(range(8)) if overlap else [42]*8) + list(range(offset+8, 16)))
+            self.assertIs(root.buffer, b)
+
+  def test_multibuffer_interpretations(self):
+    for mode in ("aggregate", "stacked", "mixed", "raw"):
+      for original in ("source", "target", "neither"):
+        with self.subTest(mode=mode, original=original):
+          if mode == "aggregate": m = UOp.new_buffer(("CPU", "CPU:1"), 1024, dtypes.float32)
+          elif mode == "raw": m = UOp.from_buffer(MultiBuffer(("CPU", "CPU:1"), 4096), dtypes.float32)
+          else:
+            first = UOp.new_buffer("CPU", 1024, dtypes.uint32 if mode == "mixed" else dtypes.float32)
+            m = first.bitcast(dtypes.float32).mstack(UOp.new_buffer("CPU:1", 1024, dtypes.float32))
+          for b in m.buffer.bufs:
+            b.ensure_allocated().copy_from(Buffer("CPU", 4096, initial_value=struct.pack("1024f", *range(1, 1025))))
+          f, i = (Tensor(UOp.from_buffer(m.buffer, dt)) for dt in (dtypes.float32, dtypes.uint32))
+          self.assertIs(f.uop.storage_base, i.uop.storage_base)
+          @TinyJit
+          def add(a, b): return (a + b.bitcast(dtypes.float32)).realize()
+          with self.assertRaisesRegex(JitError, "duplicate inputs"): add(f, i)
+          with self.assertRaisesRegex(JitError, "duplicate inputs"): add(Tensor(m), i)
+          dst = Tensor(m) if original == "target" else f
+          src = Tensor(m) if original == "source" else i.bitcast(dtypes.float32)
+          dst.assign(src.flip(0)).realize()
+          self.assertEqual(dst.tolist(), list(range(1024, 0, -1)))
+          for b in m.buffer.bufs: self.assertEqual(b.numpy(dtypes.float32).tolist(), list(range(1024, 0, -1)))
 
   def test_view_bounds(self):
     b = Buffer("CPU", 16)

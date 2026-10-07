@@ -188,13 +188,14 @@ def dtype_from_uop(op:Ops, src:tuple[UOp,...], arg:Any) -> DType:
 
 class UOpMetaClass(type):
   ucache:dict[tuple, weakref.ReferenceType[UOp]] = {}
-  buffer_uops:weakref.WeakValueDictionary[tuple[Buffer|MultiBuffer, str|tuple[str, ...]], UOp] = weakref.WeakValueDictionary()
+  buffer_uops:weakref.WeakValueDictionary[tuple[Buffer, str], UOp] = weakref.WeakValueDictionary()
   def __call__(cls, op:Ops, src:tuple[UOp,...]=tuple(), arg:Any=None, tag:Any=None, metadata:tuple[Metadata,...]|None=None):
     # NOTE: the key must separate nodes of different dtype: a CONST's dtype is the type of its arg, and True == 1 as dict keys
     if (wret:=UOpMetaClass.ucache.get(key:=(op, src, arg, tag, type(arg)), None)) is not None and (ret:=wret()) is not None: return ret
     UOpMetaClass.ucache[key] = weakref.ref(created:=super().__call__(op, src, arg, tag))
     if op is Ops.BUFFER and arg.buffer is not None and tag is None:
-      UOpMetaClass.buffer_uops.setdefault((arg.buffer, arg.device), created)
+      for b,d in zip(arg.buffer.bufs if isinstance(arg.buffer, MultiBuffer) else [arg.buffer], to_tuple(arg.device)):
+        UOpMetaClass.buffer_uops.setdefault((b, d), created)
     if metadata is not None: all_metadata[created] = metadata
     if SPEC > 1:
       from tinygrad.uop.spec import spec_full
@@ -843,10 +844,20 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     assert dtype not in dtypes.weaks and dtype.itemsize > 0 and opaque.nbytes % dtype.itemsize == 0, \
       f"cannot interpret {opaque.nbytes} bytes as {dtype}"
     device = device or opaque.device
-    if isinstance(opaque, Buffer) and opaque.base is not opaque:
+    if isinstance(opaque, MultiBuffer):
+      assert isinstance(device, tuple) and len(device) == len(opaque.bufs)
+      shards = tuple(UOp.from_buffer(b, dtypes.uint8, d) for b,d in zip(opaque.bufs, device))
+      roots = tuple(s.src[0] if s.op is Ops.BITCAST else s for s in shards)
+      if all(s.op is Ops.MSELECT and s.arg == i and s.src == roots[0].src for i,s in enumerate(roots)) and roots[0].src[0].device == device:
+        return roots[0].src[0].bitcast(dtype)
+      return UOp(Ops.MSTACK, src=roots if all_same([s.dtype for s in roots]) else shards).bitcast(dtype)
+    assert isinstance(device, str)
+    if opaque.base is not opaque:
       return UOp.from_buffer(opaque.base, dtypes.uint8, device)[opaque.offset:opaque.offset+opaque.nbytes].bitcast(dtype)
     # Reuse the live graph's storage root, including roots created by new_buffer. Types are views of that root.
-    if (root := UOpMetaClass.buffer_uops.get((opaque, device))) is not None: return root.bitcast(dtype)
+    if (root := UOpMetaClass.buffer_uops.get((opaque, device))) is not None:
+      if isinstance(root.arg.buffer, MultiBuffer): root = root.mselect(root.arg.buffer.bufs.index(opaque))
+      return root.bitcast(dtype)
     return UOp(Ops.BUFFER, src=(UOp.const(opaque.nbytes//dtype.itemsize),)+UOp.device_range_src(device),
                arg=ParamArg(-id(opaque), dtype, device=device, buffer=opaque))
   def empty_like(self, dtype:DTypeLike|None=None, device:str|tuple[str, ...]|None=None) -> UOp:
@@ -946,6 +957,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     """Check if this UOp has a storage identity in the graph, whether or not its buffer is bound."""
     # TODO: this is confusing because UOp.variable('v', 0, 1, dtypes.weakfloat) is True for jit to work, but it doesn't have a buffer
     if self.op in {Ops.RESHAPE, Ops.UNSHARD, Ops.MSELECT}: return self.src[0].has_buffer_identity(after_ok)
+    if self.op is Ops.MSTACK: return all(s.storage_base.has_buffer_identity(after_ok) for s in self.src)
     if after_ok and self.op == Ops.AFTER: return self.src[0].has_buffer_identity(after_ok)
     return self.op in GroupOp.Defines
 

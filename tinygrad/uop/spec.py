@@ -97,7 +97,7 @@ spec_shared = PatternMatcher([
   # AFTER on Movement Op, PARAM, BUFFER, ALLOC, STAGE, or another AFTER
   # CONST/CAST/NOOP are range bounds: RANGE(AFTER(CONST, other_range)) orders a loop after a sibling
   (UPat(Ops.AFTER, src=(UPat(GroupOp.Movement.union({Ops.PARAM, Ops.BUFFER, Ops.ALLOC, Ops.STAGE, Ops.INDEX,
-                                                     Ops.AFTER, Ops.UNSHARD, Ops.BITCAST, Ops.INS,
+                                                     Ops.AFTER, Ops.UNSHARD, Ops.BITCAST, Ops.INS, Ops.MSTACK, Ops.MSELECT,
                                                      Ops.CONST, Ops.CAST, Ops.NOOP, Ops.STACK})),),
         allow_any_len=True), lambda: True),
   # an AFTER can wrap a scalar ALU (e.g. a computed RANGE bound) to order it after effect ops
@@ -131,7 +131,8 @@ spec_shared = PatternMatcher([
   # STORE: the target must be storage or a STAGE realization point (or an AFTER/BITCAST/view of one);
   # STAGE targets are written into the buffer the STAGE creates. INDEX stores are checked above
   (UPat(Ops.STORE, dtypes.void, (UPat(name="x"), UPat())), lambda x:
-   True if (b:=x.storage_base).op in {Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.STAGE} else None if b.op is Ops.INDEX else False),
+   True if (b:=x.storage_base).op in {Ops.BUFFER, Ops.ALLOC, Ops.PARAM, Ops.STAGE, Ops.MSTACK, Ops.MSELECT}
+   else None if b.op is Ops.INDEX else False),
 
   # WMMA has a <a, b, acc>
   (UPat(Ops.WMMA, src=(UPat(), UPat(), UPat()), name="x"), lambda x: isinstance(x.arg, tuple) and len(x.arg) == 4),

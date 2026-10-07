@@ -707,7 +707,7 @@ class TestMultiTensor(unittest.TestCase):
   def test_from_multibuffer(self):
     buf = UOp.mstack(*(Tensor([i, i+1], device=d).realize().uop for i,d in enumerate((d0, d1)))).buffer
     u = UOp.from_buffer(buf, dtypes.int32)
-    self.assertEqual((u.device, u.shape, u.buffer), (buf.device, (2,), buf))
+    self.assertEqual((u.device, u.shape, u.buffer.bufs), (buf.device, (2,), buf.bufs))
     self.assertEqual(Tensor(u.unshard(0)).to(Device.DEFAULT).tolist(), [0, 1, 1, 2])
 
   def test_broadcast_symbolic(self):
