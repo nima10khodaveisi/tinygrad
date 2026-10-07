@@ -103,6 +103,20 @@ class TestBuffer(unittest.TestCase):
             self.assertEqual(list(b.as_memoryview()), list(range(offset)) + (list(range(8)) if overlap else [42]*8) + list(range(offset+8, 16)))
             self.assertIs(root.buffer, b)
 
+  def test_unaligned_typed_view_write(self):
+    for dtype in (dtypes.uint8, dtypes.uint16, dtypes.uint32, dtypes.float32):
+      for dst_offset, src_offset in ((1, 2), (2, 1)):
+        with self.subTest(dtype=dtype, dst_offset=dst_offset):
+          b = Buffer("CPU", 16, initial_value=bytes(range(16)))
+          root = UOp.from_buffer(b, dtype)
+          dst = Tensor(UOp.from_buffer(b.view(8, dst_offset), dtypes.uint32))
+          src = Tensor(UOp.from_buffer(b.view(8, src_offset), dtypes.uint32))
+          dst.assign(src).realize()
+          expected = bytearray(range(16))
+          expected[dst_offset:dst_offset+8] = bytes(range(src_offset, src_offset+8))
+          self.assertEqual(bytes(b.as_memoryview()), expected)
+          self.assertIs(root.buffer, b)
+
   def test_multibuffer_interpretations(self):
     for mode in ("aggregate", "stacked", "mixed", "raw"):
       for original in ("source", "target", "neither"):

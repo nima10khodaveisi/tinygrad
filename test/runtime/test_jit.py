@@ -47,6 +47,22 @@ class TestJit(unittest.TestCase):
     for _ in range(5): add(a)
     self.assertEqual(a.item(), 5)
 
+  def test_jit_byte_view_write(self):
+    for prune in (False, True):
+      with self.subTest(prune=prune):
+        @TinyJit(prune=prune)
+        def write(x):
+          x.bitcast(dtypes.uint8)[4:8].assign(42).realize()
+          return x
+        inputs = []
+        for step in range(5):
+          x = Tensor([step]*4, dtype=dtypes.uint32).realize()
+          inputs.append(x)
+          write(x)
+          self.assertEqual(x.tolist(), [step, 0x2a2a2a2a, step, step])
+          if step == 1: inputs[1].assign(99).realize()
+          if step >= 2: self.assertEqual(inputs[1].tolist(), [99]*4)
+
   def test_jit_assign_int8(self): self.test_jit_assign(dtypes.int8)
 
   def test_jit_copyin(self):
