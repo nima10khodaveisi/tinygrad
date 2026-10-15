@@ -267,14 +267,14 @@ def transform_to_call(big_sink:UOp) -> UOp:
     if u.op is not Ops.STORE: continue
     storage = u.src[0].storage_base.toposort(enter_calls=False)
     # Keep typed shards addressable too: MSTACK otherwise materializes its BITCAST sources.
-    typed_stacks = [s for s in storage if s.op is Ops.MSTACK and any(t.op is Ops.BITCAST for t in s.src)]
-    for s in typed_stacks:
-      if s.dtype is not dtypes.uint8: byte_stacks[s] = s.replace(src=tuple(t.bitcast(dtypes.uint8) for t in s.src)).bitcast(s.dtype)
-    itemsize = 1 if typed_stacks else u.src[0].dtype.itemsize
+    stacks = [s for s in storage if s.op is Ops.MSTACK]
+    itemsize = 1 if any(t.op is Ops.BITCAST for s in stacks for t in s.src) else u.src[0].dtype.itemsize
     view = u.src[0]
     while view.op in GroupOp.Movement|{Ops.BITCAST, Ops.AFTER, Ops.UNSHARD}:
       itemsize = min(itemsize, view.dtype.itemsize)
       view = view.src[0]
+    for s in stacks:
+      if itemsize < s.dtype.itemsize: byte_stacks[s] = s.replace(src=tuple(t.bitcast(dtypes.uint8) for t in s.src)).bitcast(s.dtype)
     for b in storage:
       if b.op is Ops.BUFFER and b.arg.buffer is not None and itemsize < b.dtype.itemsize:
         byte_roots[b] = b.replace(src=(UOp.const(b.arg.buffer.nbytes),)+b.src[1:], arg=replace(b.arg, dtype=dtypes.uint8)).bitcast(b.dtype)

@@ -12,6 +12,7 @@ from tinygrad.uop.movement import mop_cleanup
 from dataclasses import dataclass
 
 def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
+  needed = {b for u in needed for b in _collect_bufs(u)}
   kept, onetime = [], []
   for si in linear.src:
     si_bufs = {b for src in si.src[1:] for b in _collect_bufs(src)}
@@ -31,7 +32,16 @@ def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp]) -> UOp:
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View captured linear")
 
   # parametrize input buffers: map each input buffer UOp to a PARAM with the correct slot index
-  linear = linear.substitute({u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}, walk=True)
+  bindings = {u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}
+  # Scheduling can split a stacked input into shard arguments; retain the input slot for those aliases too.
+  for u in input_uops:
+    if u.op is not Ops.MSTACK: continue
+    for i,s in enumerate(u.src):
+      bindings[s] = p = bindings[u].mselect(i)
+      while s.op is Ops.BITCAST:
+        s = s.src[0]
+        bindings[s] = p = p.bitcast(s.dtype)
+  linear = linear.substitute(bindings, walk=True)
   linear = memory_plan_rewrite(linear, held_bufs)
   linear = linear.substitute({u: u.rtag("scratch") for u in linear.toposort() if u.op is Ops.BUFFER and u not in held_bufs}, walk=True)
   linear = compile_linear(linear, beam=getenv("JITBEAM", BEAM.value), input_uops=input_uops, cache=False)

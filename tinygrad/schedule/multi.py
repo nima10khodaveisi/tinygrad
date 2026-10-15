@@ -12,6 +12,7 @@ def _apply_shrink(marg, s:UOp, i:int) -> UOp:
   return s._mop(Ops.SHRINK, tuple(new_arg))
 
 def mstack_early_shrink(ms:UOp, shrink:UOp):
+  if ms.has_buffer_identity(): return None
   ret:list[UOp] = []
   for i, x in enumerate(ms.src):
     if x.op is Ops.COPY:

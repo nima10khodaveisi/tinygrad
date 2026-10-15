@@ -5,6 +5,12 @@ from tinygrad.engine.jit import JitError
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import UOp
 
+def multibuffer_root(mode):
+  if mode == "aggregate": return UOp.new_buffer(("CPU", "CPU:1"), 4, dtypes.uint32)
+  if mode == "raw": return UOp.from_buffer(MultiBuffer(("CPU", "CPU:1"), 16), dtypes.uint8)
+  first = UOp.new_buffer("CPU", 4, dtypes.float32 if mode == "mixed" else dtypes.uint32)
+  return first.bitcast(dtypes.uint32).mstack(UOp.new_buffer("CPU:1", 4, dtypes.uint32))
+
 class TestBuffer(unittest.TestCase):
   def test_typed_interpretation(self):
     b = Buffer("CPU", 8, initial_value=struct.pack("ff", 1, 2))
@@ -139,6 +145,46 @@ class TestBuffer(unittest.TestCase):
           dst.assign(src.flip(0)).realize()
           self.assertEqual(dst.tolist(), list(range(1024, 0, -1)))
           for b in m.buffer.bufs: self.assertEqual(b.numpy(dtypes.float32).tolist(), list(range(1024, 0, -1)))
+
+  def test_multibuffer_partial_write(self):
+    for mode in ("aggregate", "stacked", "mixed", "raw"):
+      for original in (False, True):
+        for kind in ("bytes", "typed", "overlap"):
+          with self.subTest(mode=mode, original=original, kind=kind):
+            m = multibuffer_root(mode)
+            for b in m.buffer.bufs: b.ensure_allocated().copy_from(Buffer("CPU", 16, initial_value=bytes(range(16))))
+            x = Tensor(m if original else UOp.from_buffer(m.buffer, dtypes.uint8)).bitcast(dtypes.uint8)
+            expected = bytearray(range(16))
+            if kind == "overlap":
+              view = x[1:9].bitcast(dtypes.uint32).assign(x[2:10].bitcast(dtypes.uint32)).realize()
+              expected[1:9] = bytes(range(2, 10))
+              written = expected[1:9]
+            else:
+              view = x[4:8]
+              if kind == "typed": view = view.bitcast(dtypes.uint32)
+              view.assign(42 if kind == "bytes" else 0x2a2a2a2a).realize()
+              expected[4:8] = written = bytes([42]*4)
+            self.assertEqual(view.bitcast(dtypes.uint8).tolist(), list(written))
+            for b in m.buffer.bufs: self.assertEqual(bytes(b.as_memoryview()), expected)
+
+  def test_jit_multibuffer_partial_write(self):
+    for mode in ("aggregate", "stacked", "mixed", "raw"):
+      for prune in (False, True):
+        with self.subTest(mode=mode, prune=prune):
+          @TinyJit(prune=prune)
+          def write(x):
+            x.bitcast(dtypes.uint8)[4:8].assign(42).realize()
+            return x
+          roots = []
+          for step in range(5):
+            roots.append(m:=multibuffer_root(mode))
+            for b in m.buffer.bufs: b.ensure_allocated().copy_from(Buffer("CPU", 16, initial_value=bytes([step]*16)))
+            write(Tensor(m))
+            for b in m.buffer.bufs: self.assertEqual(list(b.as_memoryview()), [step]*4 + [42]*4 + [step]*8)
+            if step == 1:
+              for b in m.buffer.bufs: b.copy_from(Buffer("CPU", 16, initial_value=bytes([99]*16)))
+            if step >= 2:
+              for b in roots[1].buffer.bufs: self.assertEqual(list(b.as_memoryview()), [99]*16)
 
   def test_view_bounds(self):
     b = Buffer("CPU", 16)
